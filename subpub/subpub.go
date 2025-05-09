@@ -3,6 +3,7 @@ package subpub
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -25,13 +26,21 @@ type SubPub interface {
 	// Close will shutdown sub-pub system.
 	// May be blocked by data delivery until the context is canceled. 
 	Close(ctx context.Context) error
+
+	GetMetrics() MetricsSnapshot
 }
 
 type Metrics struct {
-    Mu            sync.RWMutex
-    MessagesSent  int64
+    messagesSent    int64
+    messagesHandled int64
+    processingTime  int64
+    mu              sync.RWMutex
+}
+
+type MetricsSnapshot struct {
+    MessagesSent    int64
     MessagesHandled int64
-    ProcessingTime time.Duration
+    ProcessingTime  time.Duration
 }
 
 type subscriber struct {
@@ -41,6 +50,7 @@ type subscriber struct {
 	signal   chan struct{}
 	closeCh  chan struct{}
 	closed   bool
+	subPub   *subPub
 }
 
 type subscription struct {
@@ -58,17 +68,23 @@ type subPub struct {
 }
 
 // метрики
-func (s *subPub) GetMetrics() Metrics {
-    s.metrics.Mu.RLock()
-    defer s.metrics.Mu.RUnlock()
-    return s.metrics
+func (s *subPub) GetMetrics() MetricsSnapshot {
+    s.metrics.mu.RLock()
+    defer s.metrics.mu.RUnlock()
+    
+    return MetricsSnapshot{
+        MessagesSent:    s.metrics.messagesSent,
+        MessagesHandled: s.metrics.messagesHandled,
+        ProcessingTime:  time.Duration(s.metrics.processingTime),
+    }
 }
 
 func (s *subPub) updateMetrics(start time.Time) {
-    s.metrics.Mu.Lock()
-    defer s.metrics.Mu.Unlock()
-    s.metrics.MessagesHandled++
-    s.metrics.ProcessingTime += time.Since(start)
+    s.metrics.mu.Lock()
+    defer s.metrics.mu.Unlock()
+    
+    s.metrics.messagesHandled++
+    s.metrics.processingTime += int64(time.Since(start))
 }
 //
 
@@ -98,45 +114,50 @@ func (s *subPub) removeSubscriber(subject string, sub *subscriber) {
 }
 
 func (s *subPub) Subscribe(subject string, cb MessageHandler) (Subscription, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+    s.mu.Lock()
+    defer s.mu.Unlock()
 
-	if s.closed {
-		return nil, errors.New("subpub closed")
-	}
+    if s.closed {
+        return nil, errors.New("subpub closed")
+    }
 
-	sub := &subscriber{
-		handler: cb,
-		signal:  make(chan struct{}, 1),
-		closeCh: make(chan struct{}),
-	}
+    sub := &subscriber{
+        handler: cb,
+        signal:  make(chan struct{}, 1),
+        closeCh: make(chan struct{}),
+        subPub:  s,
+    }
 
-	s.subjects[subject] = append(s.subjects[subject], sub)
+    s.subjects[subject] = append(s.subjects[subject], sub)
 
-	s.wg.Add(1)
-	go sub.process(&s.wg)
+    s.wg.Add(1)
+    go sub.process()
 
-	return &subscription{
-		sub:     sub,
-		subject: subject,
-		s:       s,
-	}, nil
+    return &subscription{
+        sub:     sub,
+        subject: subject,
+        s:       s,
+    }, nil
 }
 
 func (s *subPub) Publish(subject string, msg interface{}) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+    s.mu.RLock()
+    defer s.mu.RUnlock()
 
-	if s.closed {
-		return errors.New("subpub closed")
-	}
+    if s.closed {
+        return errors.New("subpub closed")
+    }
 
-	subs := s.subjects[subject]
-	for _, sub := range subs {
-		sub.enqueue(msg)
-	}
+    s.metrics.mu.Lock()
+    s.metrics.messagesSent++
+    s.metrics.mu.Unlock()
 
-	return nil
+    subs := s.subjects[subject]
+    for _, sub := range subs {
+        sub.enqueue(msg)
+    }
+
+    return nil
 }
 
 func (s *subPub) Close(ctx context.Context) error {
@@ -202,18 +223,18 @@ func (s *subscriber) close() {
 	close(s.closeCh)
 }
 
-func (s *subscriber) process(wg *sync.WaitGroup) {
-	defer wg.Done()
+func (s *subscriber) process() {
+    defer s.subPub.wg.Done()
 
-	for {
-		select {
-		case <-s.signal:
-			s.processQueue()
-		case <-s.closeCh:
-			s.processQueue()
-			return
-		}
-	}
+    for {
+        select {
+        case <-s.signal:
+            s.processQueue()
+        case <-s.closeCh:
+            s.processQueue()
+            return
+        }
+    }
 }
 
 func (s *subscriber) processQueue() {
@@ -225,13 +246,20 @@ func (s *subscriber) processQueue() {
         s.queue = s.queue[1:]
 
         func() {
+            start := time.Now()
             s.mu.Unlock()
             defer s.mu.Lock()
             
             defer func() {
                 if r := recover(); r != nil {
-                    // тут будет логирование ошибки
+                    log.Printf("Handler panic: %v", r)
                 }
+                
+                elapsed := time.Since(start)
+                s.subPub.metrics.mu.Lock()
+                defer s.subPub.metrics.mu.Unlock()
+                s.subPub.metrics.messagesHandled++
+                s.subPub.metrics.processingTime += int64(elapsed)
             }()
             
             s.handler(msg)
