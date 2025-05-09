@@ -2,6 +2,7 @@ package subpub_test
 
 import (
 	"context"
+	"fmt"
 	"subpub/subpub"
 	"sync"
 	"sync/atomic"
@@ -240,3 +241,39 @@ func TestLoad(t *testing.T) {
     sp.Close(context.Background())
 }
 
+func TestMetrics(t *testing.T) {
+    defer goleak.VerifyNone(t)
+    
+    sp := subpub.NewSubPub()
+    var (
+        wg       sync.WaitGroup
+        received int32
+    )
+
+    const numMessages = 2
+    wg.Add(numMessages)
+
+    sub, _ := sp.Subscribe("metrics", func(msg interface{}) {
+        defer wg.Done()
+        atomic.AddInt32(&received, 1)
+        time.Sleep(10 * time.Millisecond)
+    })
+    defer sub.Unsubscribe()
+
+    for i := 0; i < numMessages; i++ {
+        sp.Publish("metrics", fmt.Sprintf("test%d", i+1))
+    }
+
+    wg.Wait()
+
+    metrics := sp.GetMetrics()
+    assert.Equal(t, int64(numMessages), metrics.MessagesSent, "Sent messages should match")
+    assert.Equal(t, int64(numMessages), metrics.MessagesHandled, "Handled messages should match")
+    assert.True(t, 
+        time.Duration(metrics.ProcessingTime) >= numMessages*10*time.Millisecond,
+        "Total processing time should be at least %v", 
+        numMessages*10*time.Millisecond,
+    )
+    
+    sp.Close(context.Background())
+}
