@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestMain(m *testing.M) {
@@ -20,7 +23,8 @@ func TestMain(m *testing.M) {
 func TestSubscribePublish(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
     var (
         received string
         mu       sync.Mutex
@@ -52,7 +56,8 @@ func TestSubscribePublish(t *testing.T) {
 func TestUnsubscribe(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	
-	sp := subpub.NewSubPub()
+	logger, _ := zap.NewDevelopment()
+	sp := subpub.NewSubPub(logger)
 	callCount := 0
 	
 	sub, _ := sp.Subscribe("test", func(msg interface{}) {
@@ -70,7 +75,8 @@ func TestUnsubscribe(t *testing.T) {
 func TestSlowSubscriber(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
     var (
         callCount int
         mu        sync.Mutex
@@ -108,7 +114,8 @@ func TestSlowSubscriber(t *testing.T) {
 func TestCloseWithTimeout(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	
-	sp := subpub.NewSubPub()
+	logger, _ := zap.NewDevelopment()
+	sp := subpub.NewSubPub(logger)
 	var wg sync.WaitGroup
 	wg.Add(1)
 
@@ -131,7 +138,8 @@ func TestCloseWithTimeout(t *testing.T) {
 func TestFIFOOrder(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
     var (
         mu       sync.Mutex
         received []int
@@ -169,7 +177,8 @@ func TestFIFOOrder(t *testing.T) {
 func TestPanicRecovery(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
     var (
         wg       sync.WaitGroup
         received int32
@@ -201,7 +210,8 @@ func TestPanicRecovery(t *testing.T) {
 func TestLoad(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
     var (
         counter int32
         wg      sync.WaitGroup
@@ -244,36 +254,160 @@ func TestLoad(t *testing.T) {
 func TestMetrics(t *testing.T) {
     defer goleak.VerifyNone(t)
     
-    sp := subpub.NewSubPub()
-    var (
-        wg       sync.WaitGroup
-        received int32
-    )
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    
+    var wg sync.WaitGroup
+    wg.Add(2)
 
-    const numMessages = 2
-    wg.Add(numMessages)
-
-    sub, _ := sp.Subscribe("metrics", func(msg interface{}) {
+    sub, err := sp.Subscribe("metrics", func(msg interface{}) {
         defer wg.Done()
-        atomic.AddInt32(&received, 1)
         time.Sleep(10 * time.Millisecond)
     })
+    require.NoError(t, err)
     defer sub.Unsubscribe()
 
-    for i := 0; i < numMessages; i++ {
-        sp.Publish("metrics", fmt.Sprintf("test%d", i+1))
-    }
+    sp.Publish("metrics", "test1")
+    sp.Publish("metrics", "test2")
 
     wg.Wait()
 
     metrics := sp.GetMetrics()
-    assert.Equal(t, int64(numMessages), metrics.MessagesSent, "Sent messages should match")
-    assert.Equal(t, int64(numMessages), metrics.MessagesHandled, "Handled messages should match")
+    assert.Equal(t, int64(2), metrics.MessagesSent, "Sent messages mismatch")
+    assert.Equal(t, int64(2), metrics.MessagesHandled, "Handled messages mismatch")
     assert.True(t, 
-        time.Duration(metrics.ProcessingTime) >= numMessages*10*time.Millisecond,
-        "Total processing time should be at least %v", 
-        numMessages*10*time.Millisecond,
+        metrics.ProcessingTime >= 20*time.Millisecond,
+        "Expected >=20ms, got %s", 
+        metrics.ProcessingTime,
     )
     
     sp.Close(context.Background())
+}
+
+func TestCloseTwice(t *testing.T) {
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    sp.Close(context.Background())
+    err := sp.Close(context.Background())
+    assert.ErrorContains(t, err, "already closed")
+}
+
+func TestPublishAfterClose(t *testing.T) {
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    sp.Close(context.Background())
+    err := sp.Publish("test", "data")
+    assert.ErrorContains(t, err, "closed bus")
+}
+
+func TestQueueOverflow(t *testing.T) {
+    core, logObserver := observer.New(zap.DebugLevel)
+    logger := zap.New(core)
+    sp := subpub.NewSubPub(logger)
+    
+    var wg sync.WaitGroup
+    wg.Add(1)
+    
+    sub, _ := sp.Subscribe("test", func(msg interface{}) {
+        defer wg.Done()
+        time.Sleep(100 * time.Millisecond)
+    })
+    
+    sp.Publish("test", "trigger")
+    wg.Wait()
+    
+    for i := 0; i < 1000; i++ {
+        sp.Publish("test", i)
+    }
+    
+    var found bool
+    for _, entry := range logObserver.All() {
+        if entry.Message == "Signal channel overflow" {
+            found = true
+            break
+        }
+    }
+    assert.True(t, found)
+    
+    sub.Unsubscribe()
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+    defer cancel()
+    sp.Close(ctx)
+}
+
+func TestConcurrentPublishSubscribe(t *testing.T) {
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    var wg sync.WaitGroup
+    
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            for j := 0; j < 100; j++ {
+                sp.Publish("data", fmt.Sprintf("msg-%d-%d", id, j))
+            }
+        }(i)
+    }
+    
+    for i := 0; i < 5; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            sp.Subscribe("data", func(msg interface{}) {})
+        }()
+    }
+    
+    wg.Wait()
+    sp.Close(context.Background())
+}
+
+func TestLoggingOnShutdown(t *testing.T) {
+    core, logObserver := observer.New(zap.DebugLevel)
+    logger := zap.New(core)
+    sp := subpub.NewSubPub(logger)
+
+    var wg sync.WaitGroup
+    wg.Add(1)
+    
+    sp.Subscribe("log-test", func(msg interface{}) {
+        defer wg.Done()
+        time.Sleep(500 * time.Millisecond)
+    })
+    
+    sp.Publish("log-test", "block")
+    
+    time.Sleep(50 * time.Millisecond)
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+    defer cancel()
+    
+    err := sp.Close(ctx)
+    assert.ErrorIs(t, err, context.DeadlineExceeded)
+    
+    time.Sleep(100 * time.Millisecond)
+    
+    assert.Greater(t, 
+        len(logObserver.FilterMessageSnippet("shutdown interrupted").All()), 
+        0,
+        "Should log shutdown interruption",
+    )
+}
+
+func TestNilHandler(t *testing.T) {
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    _, err := sp.Subscribe("test", nil)
+    assert.ErrorContains(t, err, "nil handler")
+}
+
+func TestEmptySubject(t *testing.T) {
+    logger, _ := zap.NewDevelopment()
+    sp := subpub.NewSubPub(logger)
+    _, err := sp.Subscribe("", func(msg interface{}){})
+    assert.ErrorContains(t, err, "invalid subject")
+    
+    err = sp.Publish("", "data")
+    assert.ErrorContains(t, err, "invalid subject")
 }
