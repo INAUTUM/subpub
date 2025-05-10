@@ -1,0 +1,6 @@
+GRPC_PORT: 50051
+LOG_LEVEL: debug  # Уровни: debug, info, warn, error, fatal
+LOG_FORMAT: json   # Форматы: json, console
+SERVICE_NAME: pubsub
+SUBPUB_SIGNAL_BUFFER_SIZE: 100
+SUBPUB_MAX_SUBSCRIBERS: 1000
