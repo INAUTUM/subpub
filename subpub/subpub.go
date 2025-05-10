@@ -253,12 +253,10 @@ func (s *subPub) Close(ctx context.Context) error {
         return nil
         
     case <-ctx.Done():
-        // Force close all remaining subscribers
         for _, sub := range allSubs {
             sub.close()
         }
         
-        // Wait again after force close
         select {
         case <-done:
         default:
